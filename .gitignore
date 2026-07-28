@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.log
+results/*.json
+results/*.jsonl
+results/*.md
+cache/
+*_cache/
+models/
+checkpoints/
