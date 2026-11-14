@@ -57,42 +57,35 @@ class GraphInContextLearning:
     def compute_structure_coverage(self, graph: PropagationGraph, 
                                   meta_path: MetaPath) -> float:
         """
-        计算元路径在节点邻域中的覆盖率 ρ_M(v) (式3)
-        
+        计算元路径在新闻图上的覆盖率 ρ_M(v) (式2)
+        ρ_M(v_q) = |P_M(v_q)| / (|E(G_vq)| + ε)
+
         Args:
             graph: 传播图
             meta_path: 元路径
-            
+
         Returns:
-            覆盖率 (0-1)
+            覆盖率 (>=0)，无交互边时返回 0
         """
         if not meta_path.path:
             return 0.0
-        
-        # 从图中抽取满足元路径的实例
+
+        # 分子：该新闻图内满足元路径的全部路径实例数 |P_M(v_q)|
         from graph_builder import GraphBuilder
         instances = GraphBuilder.extract_meta_path_instances(graph, meta_path.path)
-        
-        # 计算所有节点的邻域大小
-        total_neighbors = 0
-        matching_neighbors = 0
-        
-        # 遍历所有节点，统计满足元路径的交互
-        for node_id, node in graph.nodes.items():
-            if node.node_type == "News":
-                # 计算该新闻节点的一阶交互数量
-                neighbors = graph.get_neighbors(node_id)
-                total_neighbors += len(neighbors)
-                
-                # 计算满足元路径的交互数量
-                for instance in instances:
-                    if len(instance) > 0 and instance[0] == node_id:
-                        matching_neighbors += 1
-        
-        if total_neighbors == 0:
+        num_path_instances = len(instances)
+
+        # 分母：交互边数量 |E(G_vq)|（Comment / Reply / Repost，忽略细化后缀）
+        num_interaction_edges = 0
+        for edge in graph.edges:
+            base_type = edge.edge_type.split("-")[0]
+            if base_type in ("Comment", "Reply", "Repost"):
+                num_interaction_edges += 1
+
+        if num_interaction_edges == 0:
             return 0.0
-        
-        return matching_neighbors / (total_neighbors + self.epsilon)
+
+        return num_path_instances / (num_interaction_edges + self.epsilon)
     
     def compute_structure_similarity(self, graph1: PropagationGraph, 
                                     graph2: PropagationGraph,
@@ -150,43 +143,52 @@ class GraphInContextLearning:
     
     def retrieve_examples(self, query_text: str, query_graph: PropagationGraph,
                          candidate_pool: List[Dict], meta_path: MetaPath,
-                         query_embedding: Optional[np.ndarray] = None) -> List[Dict]:
+                         query_embedding: Optional[np.ndarray] = None,
+                         exclude_news_id: Optional[str] = None) -> List[Dict]:
         """
-        检索Top-k示例 D^{(M)}_{v_q} (式5后)
-        
+        检索Top-k示例 D^{(M)}_{v_q} (式4)
+        D^{M}_{v_q} = Top-k_{v_i in D_L \\ {v_q}} s(v_q, v_i | M)
+
         Args:
             query_text: 查询新闻文本
             query_graph: 查询新闻的传播图
             candidate_pool: 候选新闻池（包含文本、图和可选的 embedding）
             meta_path: 元路径
             query_embedding: 查询文本的预计算 embedding（可选）
-            
+            exclude_news_id: 需要排除的查询新闻 ID（式4 的 D_L \\ {v_q}）
+
         Returns:
             Top-k示例列表
         """
         scores = []
-        
+
         for candidate in candidate_pool:
             candidate_text = candidate.get("text", "")
             candidate_graph = candidate.get("graph")
             candidate_embedding = candidate.get("embedding")  # 预计算的 embedding
-            
+
             if candidate_graph is None:
                 continue
-            
+
+            # 式(4)：从候选集中剔除查询新闻本身，避免使用自身标签造成信息泄漏
+            if exclude_news_id is not None and candidate.get("news_id") == exclude_news_id:
+                continue
+            if query_text and candidate_text == query_text:
+                continue
+
             score = self.compute_dual_view_score(
                 query_text, query_graph,
                 candidate_text, candidate_graph,
                 meta_path,
                 query_embedding, candidate_embedding
             )
-            
+
             scores.append((score, candidate))
-        
+
         # 按得分排序，返回Top-k
         scores.sort(key=lambda x: x[0], reverse=True)
         top_k_examples = [item[1] for item in scores[:self.top_k]]
-        
+
         return top_k_examples
     
     def compute_retrieval_confidence(self, query_text: str, query_graph: PropagationGraph,

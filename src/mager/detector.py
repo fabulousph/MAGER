@@ -14,7 +14,7 @@ from tqdm import tqdm
 from data_loader import DataLoader
 from llm_client import LLMClient
 from config import get_model_config, DATA_PATHS
-from graph_builder import GraphBuilder
+from graph_builder import GraphBuilder, node_type_matches, edge_type_matches
 from meta_path import MetaPath
 from gicl import GraphInContextLearning
 from embedding_cache import EmbeddingCache
@@ -74,35 +74,38 @@ class FewShotSelectedMetaPathDetector:
         )
         print(f"ICL 候选池已加载: {len(self._icl_pool)} 条数据")
     
-    def _retrieve_examples(self, news_text: str, graph, meta_path: MetaPath) -> List[Dict]:
+    def _retrieve_examples(self, news_text: str, graph, meta_path: MetaPath,
+                           query_embedding=None, exclude_news_id=None) -> List[Dict]:
         """
-        使用 GICL 从候选池中检索最相关的示例
-        
+        使用 GICL 从候选池中检索最相关的示例（式4）
+
         Args:
             news_text: 查询新闻文本
             graph: 查询新闻的传播图
             meta_path: 元路径（用于结构相似度计算）
-            
+            query_embedding: 查询文本的预计算 embedding（可选）
+            exclude_news_id: 需要排除的查询新闻 ID（D_L \\ {v_q}）
+
         Returns:
             检索到的示例列表（最多 top_k_examples 个）
         """
         if self._icl_pool is None:
             self._load_icl_pool()
-        
+
         # 计算查询文本的 embedding（如果候选池中的 embedding 已预计算，我们也计算查询的）
-        query_embedding = self.gicl.encoder.encode([news_text])[0]
-        
-        # 使用 GICL 检索示例
-        # 注意：这里我们使用第一个元路径进行检索（或者可以合并多个元路径的结果）
-        # 为了简化，我们使用第一个元路径
+        if query_embedding is None:
+            query_embedding = self.gicl.encoder.encode([news_text])[0]
+
+        # 使用 GICL 检索示例（排除查询自身）
         examples = self.gicl.retrieve_examples(
             query_text=news_text,
             query_graph=graph,
             candidate_pool=self._icl_pool,
             meta_path=meta_path,
-            query_embedding=query_embedding
+            query_embedding=query_embedding,
+            exclude_news_id=exclude_news_id
         )
-        
+
         return examples[:self.top_k_examples]
     
     def _node_type_matches(self, actual_type: str, required_type: str) -> bool:
@@ -134,25 +137,26 @@ class FewShotSelectedMetaPathDetector:
         
         return False
     
-    def _extract_subgraph_by_meta_paths(self, graph) -> Dict[str, List[List[str]]]:
+    def _extract_subgraph_by_meta_paths(self, graph, meta_paths: Optional[List[MetaPath]] = None) -> Dict[str, List[List[str]]]:
         """
         使用选择的元路径从完整图中提取子图实例
-        
+
         Args:
             graph: PropagationGraph对象
-            
+            meta_paths: 需要抽取的元路径列表（默认使用全部已选元路径）
+
         Returns:
             {meta_path_description: [实例列表]}，每个实例是一个节点序列
         """
         subgraph_instances = {}
-        
-        for meta_path in self.selected_meta_paths:
+
+        for meta_path in (meta_paths if meta_paths is not None else self.selected_meta_paths):
             # 使用改进的提取方法（考虑节点类型灵活匹配）
             instances = self._extract_meta_path_instances_flexible(graph, meta_path.path)
-            
+
             # 存储实例（最多保留100个实例，避免过多）
             subgraph_instances[meta_path.description] = instances[:100]
-        
+
         return subgraph_instances
     
     def _extract_meta_path_instances_flexible(self, graph, meta_path: List[Tuple[str, str]]) -> List[List[str]]:
@@ -189,14 +193,10 @@ class FewShotSelectedMetaPathDetector:
             
             # 查找满足条件的边
             for edge in graph.adjacency_list.get(current_node_id, []):
-                # 检查边类型是否匹配
-                edge_matches = (edge.edge_type == edge_type or 
-                               edge.edge_type.startswith(f"{edge_type}-") or
-                               edge_type.startswith(f"{edge.edge_type}-"))
-                
-                if edge_matches:
+                # 检查边类型是否匹配（兼容增强后的细粒度/组合边类型）
+                if edge_type_matches(edge.edge_type, edge_type):
                     target_node = graph.nodes.get(edge.target)
-                    if target_node and self._node_type_matches(target_node.node_type, next_node_type):
+                    if target_node and node_type_matches(target_node.node_type, next_node_type):
                         path.append(edge.target)
                         dfs(edge.target, path, path_index + 1)
                         path.pop()  # 回溯
@@ -278,11 +278,11 @@ class FewShotSelectedMetaPathDetector:
         Returns:
             (comments_text, propagation_structure_text): 评论文本和传播结构文本
         """
-        # 收集所有评论（Comment边，用户对新闻的评论）
-        comment_edges = [e for e in graph.edges if e.edge_type == "Comment"]
-        
-        # 收集所有用户间回复（Reply边）
-        reply_edges = [e for e in graph.edges if e.edge_type == "Reply"]
+        # 收集所有评论（Comment 边，兼容 Comment-{stance}-{sentiment} 细化类型）
+        comment_edges = [e for e in graph.edges if e.edge_type.split("-")[0] == "Comment"]
+
+        # 收集所有用户间回复（Reply 边，兼容 Reply-{stance}-{sentiment} 细化类型）
+        reply_edges = [e for e in graph.edges if e.edge_type.split("-")[0] == "Reply"]
         
         # 1. Comments格式: ['id1:comment_text1', 'id2:comment_text2', ...]
         comments_list = []
@@ -384,31 +384,70 @@ class FewShotSelectedMetaPathDetector:
                 # 使用原始数据构建图
                 graph = self.graph_builder.build_from_data(news_item, news_id)
             
-            # 使用选择的元路径提取子图
-            subgraph_instances = self._extract_subgraph_by_meta_paths(graph)
-            
-            # 将子图转换为文本描述
-            subgraph_text = self._subgraph_to_text(subgraph_instances, graph)
-            
             # 获取基础图信息（评论和传播结构）
             comments_text, propagation_structure_text = self._graph_to_text(graph)
-            
-            # 使用 GICL 检索示例（使用第一个元路径进行检索）
-            # 注意：如果有多个元路径，可以合并多个检索结果，这里简化使用第一个
-            retrieved_examples = self._retrieve_examples(news_text, graph, self.selected_meta_paths[0])
-            
-            # 构建prompt（包含检索到的 few-shot 示例）
-            prompt = self._build_prompt(news_text, comments_text, propagation_structure_text, subgraph_text, retrieved_examples)
-            
+
             system_prompt = """你是一个专业的虚假新闻检测专家（Prompt V2: 对比分析专家）。你需要通过对比待检测新闻与参考案例，找出相似点和差异点，从而判断新闻的真实性。
 
 请只返回数字 0 或 1，不要返回其他任何内容：
 - 0 表示假新闻
 - 1 表示真新闻"""
-            
-            response = self.llm_client.call(prompt, system_prompt)
-            label = self._parse_label(response)
-            return label
+
+            # 查询文本 embedding 只计算一次，供检索与置信度复用
+            query_embedding = self.gicl.encoder.encode([news_text])[0]
+
+            # §4.5 检索加权推理：对每个有效元路径独立预测，再用检索置信度 c_k 加权聚合
+            path_predictions = []  # [(c_k, y_k), ...]
+            for meta_path in self.selected_meta_paths:
+                # 式(10)：过滤有效元路径（覆盖率 rho_M(v_q) > 0）
+                rho = self.gicl.compute_structure_coverage(graph, meta_path)
+                if rho <= 0.0:
+                    continue
+
+                # 抽取该元路径诱导的子图，并转换为文本
+                subgraph_instances = self._extract_subgraph_by_meta_paths(graph, [meta_path])
+                subgraph_text = self._subgraph_to_text(subgraph_instances, graph)
+
+                # 式(4)：检索该元路径下的 top-k 示范（排除查询自身 v_q）
+                examples = self._retrieve_examples(
+                    news_text, graph, meta_path,
+                    query_embedding=query_embedding,
+                    exclude_news_id=news_id
+                )
+
+                # 构建该元路径专属的检测 prompt，得到该路径的预测 y_k
+                prompt = self._build_prompt(
+                    news_text, comments_text, propagation_structure_text,
+                    subgraph_text, examples,
+                    prompt_meta_paths=[meta_path]
+                )
+                response = self.llm_client.call(prompt, system_prompt)
+                y_k = self._parse_label(response)
+
+                # 式(9)：检索置信度 c_k(v_q) = 检索到的示例相似度均值
+                c_k = self.gicl.compute_retrieval_confidence(
+                    news_text, graph, examples, meta_path,
+                    query_embedding=query_embedding
+                )
+                path_predictions.append((c_k, y_k))
+
+            # 式(10)：没有任何有效元路径时，回退到仅基于内容的预测
+            if not path_predictions:
+                fallback_prompt = self._build_content_only_prompt(
+                    news_text, comments_text, propagation_structure_text
+                )
+                response = self.llm_client.call(fallback_prompt, system_prompt)
+                return self._parse_label(response)
+
+            # 式(10)：置信度加权聚合 y_hat = I( sum(c_k*y_k)/sum(c_k) > 0.5 )
+            total_confidence = sum(c for c, _ in path_predictions)
+            if total_confidence > 0:
+                weighted_score = sum(c * y for c, y in path_predictions) / total_confidence
+            else:
+                # 所有置信度均为 0 时退化为等权投票
+                weighted_score = sum(y for _, y in path_predictions) / len(path_predictions)
+
+            return 1 if weighted_score > 0.5 else 0
             
         except Exception as e:
             print(f"检测失败: {e}")
@@ -418,7 +457,8 @@ class FewShotSelectedMetaPathDetector:
     
     def _build_prompt(self, news_text: str, comments_text: str, 
                      propagation_structure_text: str, subgraph_text: str,
-                     examples: List[Dict]) -> str:
+                     examples: List[Dict],
+                     prompt_meta_paths: Optional[List[MetaPath]] = None) -> str:
         """
         构建Few-shot检测提示词（V2: 对比分析版本）
         
@@ -437,7 +477,7 @@ class FewShotSelectedMetaPathDetector:
         
         # 构建元路径描述
         meta_path_descriptions = []
-        for mp in self.selected_meta_paths:
+        for mp in (prompt_meta_paths if prompt_meta_paths is not None else self.selected_meta_paths):
             meta_path_descriptions.append(f"- {mp.description}: {mp.to_formal_string()}")
         meta_paths_info = "\n".join(meta_path_descriptions)
         
@@ -491,6 +531,33 @@ class FewShotSelectedMetaPathDetector:
         prompt_parts.append("请基于以上对比分析，判断待检测新闻的真实性。")
         prompt_parts.append("只返回数字 0（假新闻）或 1（真新闻），不要返回其他内容。")
         
+        return "\n".join(prompt_parts)
+
+    def _build_content_only_prompt(self, news_text: str, comments_text: str,
+                                   propagation_structure_text: str) -> str:
+        """
+        构建仅基于内容的回退提示词（式10：当没有任何有效元路径时使用）
+
+        Args:
+            news_text: 新闻文本
+            comments_text: 评论文本
+            propagation_structure_text: 传播结构文本
+
+        Returns:
+            内容回退 prompt
+        """
+        if len(news_text) > 2000:
+            news_text = news_text[:2000] + "... (已截断)"
+
+        prompt_parts = [
+            "【待检测新闻】",
+            f"[Claim[id:{news_text}]]",
+            f"[Comments[{comments_text}]]",
+            f"[Propagation Structure:{propagation_structure_text}]",
+            "",
+            "请根据新闻内容、评论内容和传播结构，判断该新闻的真实性。",
+            "只返回数字 0（假新闻）或 1（真新闻），不要返回其他内容。",
+        ]
         return "\n".join(prompt_parts)
     
     def _parse_label(self, response: str) -> int:

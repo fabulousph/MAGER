@@ -5,6 +5,48 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from dataclasses import dataclass
 from collections import defaultdict
 
+
+def node_type_matches(actual_type: str, required_type: str) -> bool:
+    """
+    节点类型匹配（兼容增强后的细粒度类型）
+
+    - 精确匹配：User == User
+    - 基础类型匹配：User 可匹配 User-Normal / User-Suspicious
+    - 细化类型匹配：User-Suspicious 可匹配 User
+    """
+    if actual_type == required_type:
+        return True
+    if required_type in ("User", "News") and actual_type.startswith(f"{required_type}-"):
+        return True
+    if actual_type in ("User", "News") and required_type.startswith(f"{actual_type}-"):
+        return True
+    return False
+
+
+def edge_type_matches(actual_type: str, required_type: str) -> bool:
+    """
+    边类型匹配（兼容增强后的细化类型，如 Comment / Comment-Agree / Comment-Agree-Happy）
+
+    支持：精确匹配、前缀/细化匹配、以及"基类+组件集合"的语义包含匹配。
+    例如 required=Comment-Angry 可匹配 actual=Comment-Discuss-Angry。
+    """
+    if actual_type == required_type:
+        return True
+    # 要求的是更粗粒度类型（前缀）
+    if actual_type.startswith(f"{required_type}-"):
+        return True
+    # 要求的是更细粒度类型
+    if required_type.startswith(f"{actual_type}-"):
+        return True
+    # 组件集合包含：基类相同且要求的细化组件是实际的子集
+    actual_parts = actual_type.split("-")
+    required_parts = required_type.split("-")
+    if (len(actual_parts) > 1 and len(required_parts) > 1
+            and actual_parts[0] == required_parts[0]
+            and set(required_parts[1:]).issubset(set(actual_parts[1:]))):
+        return True
+    return False
+
 @dataclass
 class Node:
     """图节点"""
@@ -257,27 +299,12 @@ class GraphBuilder:
                 stance = edge_info.get('cognitive_stance', 'Discuss')
                 sentiment = edge_info.get('affective_sentiment', 'Neutral')
                 
-                # 添加多种细粒度的边类型，以便元路径可以从不同维度进行匹配
-                # 1. 只有立场的边
-                graph.add_edge(user_id, news_id, f"Comment-{stance}", {
-                    "text": edge_info.get("text", ""),
-                    "cognitive_stance": stance,
-                    "affective_sentiment": sentiment
-                })
-                # 2. 只有情感的边
-                graph.add_edge(user_id, news_id, f"Comment-{sentiment}", {
-                    "text": edge_info.get("text", ""),
-                    "cognitive_stance": stance,
-                    "affective_sentiment": sentiment
-                })
-                # 3. 组合边（可选）
+                # 类型重映射：一条交互只保留一条细化边（不扩增 E），符合 G'=(V,E,φ',ψ')
                 graph.add_edge(user_id, news_id, f"Comment-{stance}-{sentiment}", {
                     "text": edge_info.get("text", ""),
                     "cognitive_stance": stance,
                     "affective_sentiment": sentiment
                 })
-                # 4. 原始边
-                graph.add_edge(user_id, news_id, "Comment", {"text": edge_info.get("text", "")})
             else:
                 # 如果没有增强信息，使用原始边
                 graph.add_edge(user_id, news_id, "Comment")
@@ -308,24 +335,13 @@ class GraphBuilder:
                             edge_info = enhanced_edge_map[edge_key]
                             stance = edge_info.get('cognitive_stance', 'Discuss')
                             sentiment = edge_info.get('affective_sentiment', 'Neutral')
-                            
-                            # 添加多种细粒度的边类型
-                            graph.add_edge(user_from, user_to, f"Reply-{stance}", {
-                                "text": edge_info.get("text", ""),
-                                "cognitive_stance": stance,
-                                "affective_sentiment": sentiment
-                            })
-                            graph.add_edge(user_from, user_to, f"Reply-{sentiment}", {
-                                "text": edge_info.get("text", ""),
-                                "cognitive_stance": stance,
-                                "affective_sentiment": sentiment
-                            })
+
+                            # 类型重映射：一条回复只保留一条细化边
                             graph.add_edge(user_from, user_to, f"Reply-{stance}-{sentiment}", {
                                 "text": edge_info.get("text", ""),
                                 "cognitive_stance": stance,
                                 "affective_sentiment": sentiment
                             })
-                            graph.add_edge(user_from, user_to, "Reply", {"text": text})
                         else:
                             graph.add_edge(user_from, user_to, "Reply", {"text": text})
                     else:
@@ -335,24 +351,13 @@ class GraphBuilder:
                             edge_info = enhanced_edge_map[edge_key]
                             stance = edge_info.get('cognitive_stance', 'Discuss')
                             sentiment = edge_info.get('affective_sentiment', 'Neutral')
-                            
-                            # 添加多种细粒度的边类型
-                            graph.add_edge(user_from, news_id, f"Comment-{stance}", {
-                                "text": edge_info.get("text", ""),
-                                "cognitive_stance": stance,
-                                "affective_sentiment": sentiment
-                            })
-                            graph.add_edge(user_from, news_id, f"Comment-{sentiment}", {
-                                "text": edge_info.get("text", ""),
-                                "cognitive_stance": stance,
-                                "affective_sentiment": sentiment
-                            })
+
+                            # 类型重映射：一条评论只保留一条细化边
                             graph.add_edge(user_from, news_id, f"Comment-{stance}-{sentiment}", {
                                 "text": edge_info.get("text", ""),
                                 "cognitive_stance": stance,
                                 "affective_sentiment": sentiment
                             })
-                            graph.add_edge(user_from, news_id, "Comment", {"text": text})
                         else:
                             graph.add_edge(user_from, news_id, "Comment", {"text": text})
         
@@ -407,7 +412,7 @@ class GraphBuilder:
         # 从第一个节点类型开始
         first_node_type, first_edge = meta_path[0]
         start_nodes = [node_id for node_id, node in graph.nodes.items() 
-                      if node.node_type == first_node_type]
+                      if node_type_matches(node.node_type, first_node_type)]
         
         def dfs(current_node_id: str, path: List[str], path_index: int):
             """深度优先搜索查找元路径实例"""
@@ -424,17 +429,10 @@ class GraphBuilder:
             
             # 查找满足条件的边
             for edge in graph.adjacency_list.get(current_node_id, []):
-                # 检查边类型是否匹配
-                # 1. 完全匹配
-                # 2. 边是元路径要求的细化（如 Comment-Agree 满足 Comment）
-                # 3. 元路径要求的是边的细化（如 Comment 满足 Comment-Agree）
-                edge_matches = (edge.edge_type == edge_type or 
-                               edge.edge_type.startswith(f"{edge_type}-") or
-                               edge_type.startswith(f"{edge.edge_type}-"))
-                
-                if edge_matches:
+                # 检查边类型是否匹配（兼容增强后的细粒度/组合边类型）
+                if edge_type_matches(edge.edge_type, edge_type):
                     target_node = graph.nodes.get(edge.target)
-                    if target_node and target_node.node_type == next_node_type:
+                    if target_node and node_type_matches(target_node.node_type, next_node_type):
                         path.append(edge.target)
                         dfs(edge.target, path, path_index + 1)
                         path.pop()  # 回溯

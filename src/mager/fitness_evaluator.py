@@ -56,8 +56,9 @@ class FitnessEvaluator:
         print(f"\n    [步骤2] 计算推理质量 R_rea...")
         r_rea = self._compute_reasoning_quality(meta_path, labeled_dataset, enhanced_graphs)
         
-        # 总适应度 R_final = 0.8 * R_det + 0.2 * R_rea (式8，加权版本)
-        r_final = 0.8 * r_det + 0.2 * r_rea
+        # 总适应度（式7）：R(M) = R_det(M) + μ * R_rea(M)
+        mu = GA_CONFIG.get("mu_reasoning", 0.25)
+        r_final = r_det + mu * r_rea
         
         # 输出详细适应度分解
         print(f"\n    {'='*70}")
@@ -65,7 +66,7 @@ class FitnessEvaluator:
         print(f"    {'='*70}")
         print(f"    R_det (检测准确度): {r_det:.4f}  (正确预测数 / 总样本数)")
         print(f"    R_rea (推理质量):   {r_rea:.4f}  (平均推理质量得分)")
-        print(f"    R_final (总得分):  {r_final:.4f}  (0.8 * R_det + 0.2 * R_rea)")
+        print(f"    R_final (总得分):  {r_final:.4f}  (R_det + {mu:g} * R_rea)")
         print(f"    {'='*70}\n")
         
         meta_path.fitness = r_final
@@ -96,7 +97,8 @@ class FitnessEvaluator:
                 "text": example.get("text", ""),
                 "label": example.get("label", 0),
                 "graph": example.get("graph"),
-                "embedding": example.get("embedding")
+                "embedding": example.get("embedding"),
+                "news_id": example.get("news_id")
             })
         
         print(f"      [使用embedding_cache的100条候选池，从中检索4条进行评估]")
@@ -124,7 +126,8 @@ class FitnessEvaluator:
             try:
                 query_embedding = self.gicl.encoder.encode([news_text])[0]
                 examples = self.gicl.retrieve_examples(
-                    news_text, graph, context_data, meta_path, query_embedding=query_embedding
+                    news_text, graph, context_data, meta_path, query_embedding=query_embedding,
+                    exclude_news_id=news_id
                 )
                 
                 # 确保只使用检索到的4条（或更少）
@@ -249,7 +252,8 @@ class FitnessEvaluator:
             # 使用GICL从100条候选池中检索4条最相关的示例
             query_embedding = self.gicl.encoder.encode([news_text])[0]
             examples = self.gicl.retrieve_examples(
-                news_text, graph, context_data, meta_path, query_embedding=query_embedding
+                news_text, graph, context_data, meta_path, query_embedding=query_embedding,
+                exclude_news_id=news_id
             )
             
             # 确保只使用检索到的4条（或更少）

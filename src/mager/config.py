@@ -102,6 +102,8 @@ GA_CONFIG = {
     "top_k_retrieval": 4,
     "lambda_structure": 0.5,
     "epsilon": 1e-5,
+    # 推理质量权重 μ：式(7) R(M) = R_det(M) + μ * R_rea(M)
+    "mu_reasoning": float(os.getenv("MAGER_MU_REASONING", "0.25")),
     "max_workers": int(os.getenv("MAGER_MAX_WORKERS", "20")),
 }
 
