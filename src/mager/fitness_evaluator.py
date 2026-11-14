@@ -26,8 +26,8 @@ class FitnessEvaluator:
         """加载embedding_cache中的100条候选池"""
         if self._icl_pool is not None:
             return
-        print("      [加载embedding_cache的候选池（数据集的1/8）]")
-        self._icl_pool = self.embedding_cache.prepare_icl_pool(pool_size=None, force_recompute=False)  # None表示使用数据集的1/8
+        print("      [加载embedding_cache的候选池（论文默认 100 条监督池）]")
+        self._icl_pool = self.embedding_cache.prepare_icl_pool(pool_size=None, force_recompute=False)  # None 表示使用论文默认的 100 条
         print(f"      [已加载 {len(self._icl_pool)} 条候选池数据]")
     
     def evaluate_fitness(self, meta_path: MetaPath, labeled_dataset: List[Dict],

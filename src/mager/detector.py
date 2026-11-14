@@ -31,8 +31,9 @@ class FewShotSelectedMetaPathDetector:
         
         Args:
             model_config_name: 使用的模型配置名称（默认使用检测智能体配置）
-            selected_meta_paths: 用户选择的元路径列表（2-3个）
-            icl_pool_size: ICL 候选池大小（默认100）
+            selected_meta_paths: 用于推理的元路径列表（≥1 个）；
+                论文 §4.5 会用整个进化种群 P*（K=20 条）做 Eq(10) 加权聚合
+            icl_pool_size: ICL 候选池大小（默认100，与论文 §5.1 监督池一致）
             top_k_examples: 检索的示例数量（默认4）
         """
         self.llm_client = LLMClient(model_config_name)
@@ -51,8 +52,9 @@ class FewShotSelectedMetaPathDetector:
                 MetaPath(path=[("User", "Reply"), ("User", "")], description="用户回复用户"),
             ]
         
-        if len(selected_meta_paths) < 2 or len(selected_meta_paths) > 3:
-            raise ValueError("请选择2-3个元路径")
+        # 论文 §4.5 以整个进化种群 P* 做加权聚合，条数为 K（如 20），因此不再限制为 2-3 条
+        if len(selected_meta_paths) < 1:
+            raise ValueError("至少需要 1 个元路径")
         
         self.selected_meta_paths = selected_meta_paths
         print(f"已选择 {len(selected_meta_paths)} 个元路径:")
@@ -604,20 +606,40 @@ class FewShotSelectedMetaPathDetector:
         return model_name_clean
     
     def _get_meta_paths_str(self) -> str:
-        """获取选择的元路径的字符串表示（用于文件名）"""
+        """获取元路径集合的短标识（用于文件名）
+
+        当元路径较多（如整个种群 K=20）时，直接拼接描述会让文件名超长，
+        因此超过 3 条时改用 "K{数量}_{哈希}" 的紧凑形式。
+        """
+        import hashlib
+
         mp_strs = []
         for mp in self.selected_meta_paths:
             # 使用描述的前几个词作为标识
             desc_words = mp.description.split()[:2]
             mp_strs.append("_".join(desc_words))
+
+        # 条数较多时用数量+短哈希，避免文件名过长导致创建失败
+        if len(mp_strs) > 3:
+            digest = hashlib.md5("|".join(mp_strs).encode("utf-8")).hexdigest()[:8]
+            return f"K{len(mp_strs)}_{digest}"
+
         return "_".join(mp_strs)
-    
+
+    def _news_id_for_item(self, item: Dict) -> str:
+        """按检测器统一规则计算某条新闻的 news_id（与 detect 内部保持一致）"""
+        news_text = item.get("article", {}).get("article_content", "")
+        return f"news_{hash(news_text) % 1000000}"
+
     def evaluate(self, test_dataset: Optional[List[Dict]] = None, 
                  limit: Optional[int] = None,
                  save_results: bool = True,
                  output_dir: str = "result") -> Dict:
         """
-        评估检测性能（使用增强后的数据集）
+        评估检测性能（使用增强后的数据集）。
+
+        指标口径与论文 §5.2 一致：以“假新闻(label=0)”为正类计算
+        Precision / Recall / F1；Accuracy 为整体正确率。
         """
         import json
         import os
@@ -628,11 +650,25 @@ class FewShotSelectedMetaPathDetector:
             self._load_icl_pool()
         
         if test_dataset is None:
-            # 使用增强后的数据集
+            # 使用增强后的数据集作为评测集
             test_dataset = self.data_loader.load_enhanced_dataset()
-            if limit:
-                test_dataset = test_dataset[:limit]
-        
+
+            # 去泄漏（论文 §5.1）：评测集应为“监督池之外的剩余样本”，
+            # 先剔除与 ICL 监督池重合的样本，再应用 limit。
+            pool_ids = {ex.get("news_id") for ex in (self._icl_pool or []) if ex.get("news_id")}
+            if pool_ids:
+                before = len(test_dataset)
+                test_dataset = [it for it in test_dataset
+                                if self._news_id_for_item(it) not in pool_ids]
+                print(f"去泄漏: 从评测集剔除监督池重合样本 {before - len(test_dataset)} 条 "
+                      f"({before} -> {len(test_dataset)})")
+
+            # 随机抽样（固定种子）取 limit 条，避免按文件顺序取到单一类别导致指标失真
+            if limit and len(test_dataset) > limit:
+                import random
+                random.seed(42)
+                test_dataset = random.sample(test_dataset, limit)
+
         print("len(test_dataset):", len(test_dataset))
         
         # 准备数据
@@ -723,22 +759,25 @@ class FewShotSelectedMetaPathDetector:
         
         sample_results = [r for r in sample_results if r is not None]
         
+        # 按论文 §5.2 口径统计混淆矩阵：以“假新闻(label=0)”为正类
         for sample_result in sample_results:
             predicted_label = sample_result["predicted_label"]
             true_label = sample_result["true_label"]
-            
+
             if predicted_label == true_label:
                 correct += 1
-                if true_label == 1:
+                # 真正例 TP：真实为假且预测为假；真负例 TN：真实为真且预测为真
+                if true_label == 0:
                     true_positives += 1
                 else:
                     true_negatives += 1
             else:
-                if true_label == 1 and predicted_label == 0:
+                # 假负例 FN：真实为假但预测为真；假正例 FP：真实为真但预测为假
+                if true_label == 0 and predicted_label == 1:
                     false_negatives += 1
-                elif true_label == 0 and predicted_label == 1:
+                elif true_label == 1 and predicted_label == 0:
                     false_positives += 1
-            
+
             total += 1
         
         accuracy = correct / total if total > 0 else 0.0
@@ -754,6 +793,8 @@ class FewShotSelectedMetaPathDetector:
                 "dataset": dataset_name,
                 "model": model_name,
                 "method": f"few-shot-selected-meta-path-gicl-{self.prompt_version}",
+                # 正类定义：与论文一致，采用“假新闻”(label=0) 为正类
+                "positive_class": "fake(label=0)",
                 "icl_pool_size": self.icl_pool_size,
                 "top_k_examples": self.top_k_examples,
                 "selected_meta_paths": [{"description": mp.description, "path": str(mp.to_formal_string())} 
@@ -779,6 +820,7 @@ class FewShotSelectedMetaPathDetector:
             "precision": precision,
             "recall": recall,
             "f1_score": f1_score,
+            "positive_class": "fake(label=0)",
             "total_samples": total,
             "correct": correct,
             "true_positives": true_positives,
