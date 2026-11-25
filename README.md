@@ -1,4 +1,5 @@
 # MAGER
+The source code for the paper "Reasoning through Evolution: Automatic Meta-path Discovery for LLM-based Fake News Detection" is available at https://arxiv.org/abs/2609.18597.
 
 ## 1. Install
 
